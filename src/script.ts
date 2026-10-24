@@ -1,294 +1,348 @@
-(() => {
-  interface TrackPoint {
-    lat: number;
-    lng: number;
-    t: number;
-    acc: number;
+declare const L: any;
+
+type Point = { lat: number; lng: number; t: number };
+
+const KEY = "urma:track";
+const FONT = "system-ui, sans-serif";
+
+const el = (id: string) => document.getElementById(id) as HTMLButtonElement;
+const statusEl = el("status");
+const toggleBtn = el("btn-toggle");
+const finishBtn = el("btn-finish");
+const followBtn = el("btn-follow");
+const imageBtn = el("btn-image");
+
+const map = L.map("map", { zoomControl: false }).setView([47.0105, 28.8638], 13);
+L.control.zoom({ position: "topright" }).addTo(map);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  crossOrigin: "anonymous",
+  attribution: "© OpenStreetMap contributors",
+}).addTo(map);
+
+const trail = L.polyline([], { color: "#FE7F2D", weight: 5 }).addTo(map);
+const endpoints = L.layerGroup().addTo(map);
+const circle = L.circle([0, 0], { radius: 0, weight: 1, color: "#233D4D", fillOpacity: 0.12 });
+const marker = L.marker([0, 0], {
+  interactive: false,
+  icon: L.divIcon({ className: "", html: '<div class="me-dot" id="me-dot"></div>', iconSize: [18, 18] }),
+});
+
+let points: Point[] = [];
+let distance = 0;
+let activeMs = 0;
+let startedAt = 0;
+let speed = 0;
+let watchId: number | null = null;
+let follow = true;
+let finished = false;
+let wakeLock: WakeLockSentinel | null = null;
+
+const dist = (a: Point, b: Point) => L.latLng(a).distanceTo(b);
+const formatTime = (ms: number) => new Date(ms).toISOString().slice(11, 19);
+const time = () => activeMs + (startedAt ? Date.now() - startedAt : 0);
+
+function setStatus(text: string, isError = false) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("error", isError);
+}
+
+function setFollow(on: boolean) {
+  follow = on;
+  followBtn.setAttribute("aria-pressed", String(on));
+}
+
+function render() {
+  el("stat-dist").textContent = `${(distance / 1000).toFixed(2)} km`;
+  el("stat-time").textContent = formatTime(time());
+  el("stat-speed").textContent = `${speed.toFixed(1)} km/h`;
+  toggleBtn.textContent = watchId !== null ? "Stop" : finished ? "New route" : points.length ? "Resume" : "Start";
+  toggleBtn.classList.toggle("running", watchId !== null);
+  finishBtn.disabled = finished || !points.length;
+  imageBtn.disabled = points.length < 2;
+  document.getElementById("me-dot")?.classList.toggle("live", watchId !== null);
+}
+
+function save() {
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ points, activeMs: time(), finished }));
+  } catch {}
+}
+
+function showEnds() {
+  endpoints.clearLayers();
+  const dot = (p: Point, fill: string, ring: string) =>
+    L.circleMarker(p, { radius: 8, weight: 3, color: ring, fillColor: fill, fillOpacity: 1 }).addTo(endpoints);
+  dot(points[0], "#EAECF0", "#000000");
+  dot(points[points.length - 1], "#000000", "#EAECF0");
+}
+
+function fit() {
+  if (points.length > 1) {
+    map.fitBounds(trail.getBounds(), { paddingTopLeft: [40, 40], paddingBottomRight: [40, 280], maxZoom: 18 });
+  } else if (points.length) {
+    map.setView(points[0], 16);
   }
+}
 
-  interface SavedTrack {
-    points: TrackPoint[];
-    activeMs: number;
-  }
-
-  const STORAGE_KEY = "urma:track";
-  const MAX_ACCURACY_M = 50;
-  const MIN_STEP_M = 4;
-
-  const $ = <T extends HTMLElement>(id: string): T => {
-    const el = document.getElementById(id);
-    if (!el) throw new Error(`Missing element #${id}`);
-    return el as T;
-  };
-
-  function haversine(a: TrackPoint, b: TrackPoint): number {
-    const R = 6371000;
-    const toRad = (d: number) => (d * Math.PI) / 180;
-    const dLat = toRad(b.lat - a.lat);
-    const dLng = toRad(b.lng - a.lng);
-    const h =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
-    return 2 * R * Math.asin(Math.sqrt(h));
-  }
-
-  const fmtNum = (n: number, digits: number) =>
-    n.toLocaleString("en-US", {
-      minimumFractionDigits: digits,
-      maximumFractionDigits: digits,
-    });
-
-  function fmtDuration(ms: number): string {
-    const s = Math.floor(ms / 1000);
-    const pad = (n: number) => String(n).padStart(2, "0");
-    return `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
-  }
-
-  const statusEl = $<HTMLParagraphElement>("status");
-  const distEl = $<HTMLElement>("stat-dist");
-  const timeEl = $<HTMLElement>("stat-time");
-  const speedEl = $<HTMLElement>("stat-speed");
-  const toggleBtn = $<HTMLButtonElement>("btn-toggle");
-  const followBtn = $<HTMLButtonElement>("btn-follow");
-  const gpxBtn = $<HTMLButtonElement>("btn-gpx");
-  const resetBtn = $<HTMLButtonElement>("btn-reset");
-
-  function setStatus(text: string, isError = false): void {
-    statusEl.textContent = text;
-    statusEl.classList.toggle("error", isError);
-  }
-
-  const map = L.map("map", { zoomControl: false }).setView([47.0105, 28.8638], 13);
-  L.control.zoom({ position: "topright" }).addTo(map);
-
-  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
-    attribution: "© OpenStreetMap contributors",
-  }).addTo(map);
-
-  const trail = L.polyline([], { color: "#ff6b35", weight: 5, opacity: 0.9 }).addTo(map);
-  const accuracyCircle = L.circle([0, 0], {
-    radius: 0,
-    weight: 1,
-    color: "#0a84ff",
-    fillColor: "#0a84ff",
-    fillOpacity: 0.12,
-  });
-  const meIcon = L.divIcon({
-    className: "",
-    html: '<div class="me-dot" id="me-dot"></div>',
-    iconSize: [18, 18],
-    iconAnchor: [9, 9],
-  });
-  const marker = L.marker([0, 0], { icon: meIcon, interactive: false });
-  let markerOnMap = false;
-
-  let points: TrackPoint[] = [];
-  let distanceM = 0;
-  let activeMs = 0;
-  let sessionStart = 0;
-  let watchId: number | null = null;
-  let timerId: number | undefined;
-  let follow = true;
-  let wakeLock: WakeLockSentinel | null = null;
-  let lastSpeedKmh = 0;
-
-  const isTracking = () => watchId !== null;
-
-  function currentActiveMs(): number {
-    return activeMs + (sessionStart ? Date.now() - sessionStart : 0);
-  }
-
-  function render(): void {
-    distEl.textContent = `${fmtNum(distanceM / 1000, 2)} km`;
-    timeEl.textContent = fmtDuration(currentActiveMs());
-    speedEl.textContent = `${fmtNum(lastSpeedKmh, 1)} km/h`;
-    toggleBtn.textContent = isTracking() ? "Stop" : points.length > 0 ? "Resume" : "Start";
-    toggleBtn.classList.toggle("running", isTracking());
-    gpxBtn.disabled = points.length < 2;
-    resetBtn.disabled = points.length === 0 && !isTracking();
-  }
-
-  function save(): void {
-    try {
-      const data: SavedTrack = { points, activeMs: currentActiveMs() };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    } catch {}
-  }
-
-  function load(): void {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const data = JSON.parse(raw) as SavedTrack;
-      points = Array.isArray(data.points) ? data.points : [];
-      activeMs = Number(data.activeMs) || 0;
-      distanceM = points.reduce((sum, p, i) => (i ? sum + haversine(points[i - 1], p) : 0), 0);
-      trail.setLatLngs(points.map((p) => [p.lat, p.lng] as L.LatLngTuple));
-      if (points.length > 1) map.fitBounds(trail.getBounds(), { padding: [40, 40] });
-      else if (points.length === 1) map.setView([points[0].lat, points[0].lng], 16);
-      if (points.length > 0) setStatus("Loaded your saved route.");
-    } catch {}
-  }
-
-  function showMe(lat: number, lng: number, accuracy: number): void {
-    const ll = L.latLng(lat, lng);
-    if (!markerOnMap) {
-      marker.addTo(map);
-      accuracyCircle.addTo(map);
-      markerOnMap = true;
+function load() {
+  try {
+    const data = JSON.parse(localStorage.getItem(KEY) || "null");
+    if (!data || !data.points?.length) return;
+    points = data.points;
+    activeMs = data.activeMs || 0;
+    finished = !!data.finished;
+    distance = points.slice(1).reduce((sum, p, i) => sum + dist(points[i], p), 0);
+    trail.setLatLngs(points);
+    fit();
+    if (finished) {
+      showEnds();
+      setFollow(false);
     }
-    marker.setLatLng(ll);
-    accuracyCircle.setLatLng(ll).setRadius(accuracy);
+    setStatus(finished ? "Loaded your finished route." : "Loaded your saved route.");
+  } catch {}
+}
+
+function onPosition(pos: GeolocationPosition) {
+  const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+  marker.setLatLng([lat, lng]).addTo(map);
+  circle.setLatLng([lat, lng]).setRadius(accuracy).addTo(map);
+  if (follow) map.panTo([lat, lng]);
+
+  if (accuracy > 50) {
+    setStatus(`Weak signal (±${Math.round(accuracy)} m). Waiting for a more accurate position…`);
+    return;
   }
+  setStatus(`Tracking · accuracy ±${Math.round(accuracy)} m`);
 
-  function onPosition(pos: GeolocationPosition): void {
-    const { latitude, longitude, accuracy, speed } = pos.coords;
-    showMe(latitude, longitude, accuracy);
-
-    if (follow) map.panTo([latitude, longitude]);
-
-    if (accuracy > MAX_ACCURACY_M) {
-      setStatus(`Weak signal (±${Math.round(accuracy)} m). Waiting for a more accurate position…`);
+  const point = { lat, lng, t: pos.timestamp };
+  const prev = points[points.length - 1];
+  if (prev) {
+    const step = dist(prev, point);
+    if (step < 4) {
+      speed = 0;
       return;
     }
-
-    const point: TrackPoint = { lat: latitude, lng: longitude, t: pos.timestamp, acc: accuracy };
-    const prev = points[points.length - 1];
-
-    if (prev) {
-      const step = haversine(prev, point);
-      if (step < MIN_STEP_M) {
-        lastSpeedKmh = 0;
-        setStatus(`Tracking · accuracy ±${Math.round(accuracy)} m`);
-        render();
-        return;
-      }
-      distanceM += step;
-      const dt = (point.t - prev.t) / 1000;
-      lastSpeedKmh = speed != null && !Number.isNaN(speed) ? speed * 3.6 : dt > 0 ? (step / dt) * 3.6 : 0;
-    }
-
-    points.push(point);
-    trail.addLatLng([latitude, longitude]);
-    setStatus(`Tracking · accuracy ±${Math.round(accuracy)} m`);
-    save();
-    render();
+    distance += step;
+    const seconds = Math.max((point.t - prev.t) / 1000, 1);
+    speed = pos.coords.speed != null ? pos.coords.speed * 3.6 : (step / seconds) * 3.6;
   }
-
-  function onError(err: GeolocationPositionError): void {
-    const messages: Record<number, string> = {
-      1: "Location permission was denied. Enable it in your browser settings.",
-      2: "Your position can't be determined. Check your GPS or connection.",
-      3: "Finding your position timed out. Trying again…",
-    };
-    setStatus(messages[err.code] ?? err.message, true);
-    if (err.code === 1) stopTracking();
-  }
-
-  async function requestWakeLock(): Promise<void> {
-    try {
-      if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
-    } catch {}
-  }
-
-  async function releaseWakeLock(): Promise<void> {
-    try {
-      await wakeLock?.release();
-    } catch {}
-    wakeLock = null;
-  }
-
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && isTracking()) void requestWakeLock();
-  });
-
-  function startTracking(): void {
-    if (!("geolocation" in navigator)) {
-      setStatus("Your browser doesn't support geolocation.", true);
-      return;
-    }
-    sessionStart = Date.now();
-    setStatus("Finding your position…");
-    watchId = navigator.geolocation.watchPosition(onPosition, onError, {
-      enableHighAccuracy: true,
-      maximumAge: 0,
-      timeout: 20000,
-    });
-    timerId = window.setInterval(render, 1000);
-    document.getElementById("me-dot")?.classList.add("live");
-    void requestWakeLock();
-    render();
-  }
-
-  function stopTracking(): void {
-    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
-    watchId = null;
-    activeMs = currentActiveMs();
-    sessionStart = 0;
-    window.clearInterval(timerId);
-    document.getElementById("me-dot")?.classList.remove("live");
-    lastSpeedKmh = 0;
-    void releaseWakeLock();
-    save();
-    setStatus(points.length ? "Tracking stopped. Route saved on this device." : "Tracking stopped.");
-    render();
-  }
-
-  function exportGpx(): void {
-    if (points.length < 2) return;
-    const pts = points
-      .map((p) => `      <trkpt lat="${p.lat}" lon="${p.lng}"><time>${new Date(p.t).toISOString()}</time></trkpt>`)
-      .join("\n");
-    const gpx = `<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="Trace" xmlns="http://www.topografix.com/GPX/1/1">
-  <trk>
-    <name>Route ${new Date(points[0].t).toLocaleDateString("en-US")}</name>
-    <trkseg>
-${pts}
-    </trkseg>
-  </trk>
-</gpx>`;
-    const url = URL.createObjectURL(new Blob([gpx], { type: "application/gpx+xml" }));
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `route-${new Date(points[0].t).toISOString().slice(0, 10)}.gpx`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  function resetTrack(): void {
-    if (!window.confirm("Delete the saved route?")) return;
-    if (isTracking()) stopTracking();
-    points = [];
-    distanceM = 0;
-    activeMs = 0;
-    lastSpeedKmh = 0;
-    trail.setLatLngs([]);
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-    } catch {}
-    setStatus("Route deleted. Press Start to begin again.");
-    render();
-  }
-
-  toggleBtn.addEventListener("click", () => (isTracking() ? stopTracking() : startTracking()));
-  gpxBtn.addEventListener("click", exportGpx);
-  resetBtn.addEventListener("click", resetTrack);
-  followBtn.addEventListener("click", () => {
-    follow = !follow;
-    followBtn.setAttribute("aria-pressed", String(follow));
-  });
-
-  map.on("dragstart", () => {
-    if (follow) {
-      follow = false;
-      followBtn.setAttribute("aria-pressed", "false");
-    }
-  });
-
-  load();
+  points.push(point);
+  trail.addLatLng(point);
+  save();
   render();
-})();
+}
+
+function onError(err: GeolocationPositionError) {
+  const messages: Record<number, string> = {
+    1: "Location permission was denied. Enable it in your browser settings.",
+    2: "Your position can't be determined. Check your GPS or connection.",
+    3: "Finding your position timed out. Trying again…",
+  };
+  setStatus(messages[err.code] ?? err.message, true);
+  if (err.code === 1) stopTracking();
+}
+
+async function lockScreen() {
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+  } catch {}
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && watchId !== null) lockScreen();
+});
+
+function startTracking() {
+  if (!navigator.geolocation) {
+    setStatus("Your browser doesn't support geolocation.", true);
+    return;
+  }
+  startedAt = Date.now();
+  setStatus("Finding your position…");
+  watchId = navigator.geolocation.watchPosition(onPosition, onError, {
+    enableHighAccuracy: true,
+    maximumAge: 0,
+    timeout: 20000,
+  });
+  lockScreen();
+  render();
+}
+
+function stopTracking() {
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  activeMs = time();
+  startedAt = 0;
+  speed = 0;
+  wakeLock?.release();
+  wakeLock = null;
+  save();
+  setStatus(points.length ? "Tracking stopped. Route saved on this device." : "Tracking stopped.");
+  render();
+}
+
+function finishRoute() {
+  if (watchId !== null) stopTracking();
+  finished = true;
+  marker.remove();
+  circle.remove();
+  showEnds();
+  setFollow(false);
+  fit();
+  save();
+  setStatus(`Route finished · ${(distance / 1000).toFixed(2)} km in ${formatTime(activeMs)}. Save the image to keep it.`);
+  render();
+}
+
+function newRoute() {
+  points = [];
+  distance = 0;
+  activeMs = 0;
+  speed = 0;
+  finished = false;
+  trail.setLatLngs([]);
+  endpoints.clearLayers();
+  setFollow(true);
+  save();
+}
+
+async function drawImage() {
+  const W = 1080;
+  const H = 1080;
+  const FOOTER = 220;
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H + FOOTER;
+  const ctx = canvas.getContext("2d")!;
+
+  const bounds = L.latLngBounds(points);
+  let zoom = 18;
+  while (zoom > 1) {
+    const size = map.project(bounds.getSouthEast(), zoom).subtract(map.project(bounds.getNorthWest(), zoom));
+    if (size.x <= W - 180 && size.y <= H - 180) break;
+    zoom--;
+  }
+  const center = map.project(bounds.getNorthWest(), zoom).add(map.project(bounds.getSouthEast(), zoom)).divideBy(2);
+  const origin = center.subtract([W / 2, H / 2]);
+  const first = origin.divideBy(256).floor();
+  const last = origin.add([W, H]).divideBy(256).floor();
+
+  ctx.fillStyle = "#EAECF0";
+  ctx.fillRect(0, 0, W, H);
+  const tiles: Promise<void>[] = [];
+  for (let x = first.x; x <= last.x; x++) {
+    for (let y = first.y; y <= last.y; y++) {
+      tiles.push(
+        new Promise((resolve) => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.onload = () => {
+            ctx.drawImage(img, x * 256 - origin.x, y * 256 - origin.y);
+            resolve();
+          };
+          img.onerror = () => resolve();
+          img.src = `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
+        })
+      );
+    }
+  }
+  await Promise.all(tiles);
+
+  const toCanvas = (p: Point) => map.project(p, zoom).subtract(origin);
+  const line = (color: string, width: number) => {
+    ctx.beginPath();
+    points.forEach((p, i) => {
+      const c = toCanvas(p);
+      if (i) ctx.lineTo(c.x, c.y);
+      else ctx.moveTo(c.x, c.y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.stroke();
+  };
+  const dot = (p: Point, fill: string, ring: string) => {
+    const c = toCanvas(p);
+    ctx.fillStyle = ring;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 20, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 14, 0, Math.PI * 2);
+    ctx.fill();
+  };
+  line("#EAECF0", 16);
+  line("#FE7F2D", 10);
+  dot(points[0], "#EAECF0", "#000000");
+  dot(points[points.length - 1], "#000000", "#EAECF0");
+
+  ctx.fillStyle = "rgba(234, 236, 240, 0.9)";
+  ctx.fillRect(W - 270, H - 32, 270, 32);
+  ctx.fillStyle = "#233D4D";
+  ctx.font = `18px ${FONT}`;
+  ctx.textAlign = "right";
+  ctx.fillText("© OpenStreetMap contributors", W - 10, H - 10);
+
+  ctx.fillStyle = "#EAECF0";
+  ctx.fillRect(0, H, W, FOOTER);
+  ctx.fillStyle = "#FE7F2D";
+  ctx.fillRect(0, H, W, 6);
+  ctx.fillStyle = "#233D4D";
+  ctx.font = `600 26px ${FONT}`;
+  ctx.textAlign = "left";
+  ctx.fillText(new Date(points[0].t).toLocaleDateString("en-US", { dateStyle: "long" }), 40, H + 50);
+
+  const ms = time();
+  const stats = [
+    [`${(distance / 1000).toFixed(2)} km`, "DISTANCE"],
+    [formatTime(ms), "TIME"],
+    [`${(ms ? (distance / ms) * 3600 : 0).toFixed(1)} km/h`, "AVG SPEED"],
+  ];
+  ctx.textAlign = "center";
+  stats.forEach(([value, label], i) => {
+    const x = (W / 3) * (i + 0.5);
+    ctx.fillStyle = "#000000";
+    ctx.font = `700 54px ${FONT}`;
+    ctx.fillText(value, x, H + 130);
+    ctx.fillStyle = "#233D4D";
+    ctx.font = `600 22px ${FONT}`;
+    ctx.fillText(label, x, H + 175);
+  });
+  return canvas;
+}
+
+async function saveImage() {
+  imageBtn.disabled = true;
+  setStatus("Rendering image…");
+  try {
+    const canvas = await drawImage();
+    const link = document.createElement("a");
+    link.href = canvas.toDataURL("image/png");
+    link.download = `route-${new Date(points[0].t).toISOString().slice(0, 10)}.png`;
+    link.click();
+    setStatus("Image saved.");
+  } catch {
+    setStatus("Couldn't create the image. Check your connection and try again.", true);
+  }
+}
+
+toggleBtn.onclick = () => {
+  if (watchId !== null) {
+    stopTracking();
+  } else if (!finished || confirm("Start a new route? The finished route will be cleared.")) {
+    if (finished) newRoute();
+    startTracking();
+  }
+};
+finishBtn.onclick = finishRoute;
+imageBtn.onclick = saveImage;
+followBtn.onclick = () => setFollow(!follow);
+map.on("dragstart", () => setFollow(false));
+
+load();
+render();
+setInterval(render, 1000);
+
