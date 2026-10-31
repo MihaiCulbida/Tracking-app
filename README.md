@@ -1,2 +1,4 @@
 # Tracking-app
-A web application for tracking routes on an interactive map. The project enables real-time location recording and route visualization, delivering essential tracking functionality in a clean, user-friendly interface
+
+A web app for tracking routes on an interactive map. It records your location in real time, draws your route on the map and shows your distance, time and speed.
+
