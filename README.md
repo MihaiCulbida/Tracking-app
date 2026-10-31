@@ -21,3 +21,4 @@ A web app for tracking routes on an interactive map. It records your location in
 - **Follow me**: keeps the map centered on your position. Press it again to turn it off and move the map freely.
 - **Save image**: saves the map with your route as an image.
 
+Live at [mihaiculbida.github.io/Tracking-app/](https://mihaiculbida.github.io/Tracking-app/)
